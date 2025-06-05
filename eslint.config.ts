@@ -20,15 +20,28 @@ export default defineConfigWithVueTs(
 
   pluginVue.configs['flat/essential'],
   vueTsConfigs.recommended,
-  
+
   {
     ...pluginVitest.configs.recommended,
     files: ['src/**/__tests__/*'],
   },
-  
+
   {
     ...pluginPlaywright.configs['flat/recommended'],
     files: ['e2e/**/*.{test,spec}.{js,ts,jsx,tsx}'],
   },
   skipFormatting,
+  {
+    rules: {
+      'no-unused-vars': 'warn',
+      '@typescript-eslint/no-unused-vars': 'off',
+      '@typescript-eslint/no-explicit-any': [
+        'off', // Set severity to "warn"
+        {
+          // fixToUnknown: true, // Optional: The fixer will replace `any` with `unknown`
+          // ignoreRestArgs: true, // Optional: Allows `...args: any[]`
+        },
+      ],
+    },
+  },
 )

@@ -7,7 +7,6 @@
     },
     "target": "ESNext", // Or "ES2020", "ES2022"
     "module": "ESNext",  
-
   },
   "references": [
     {

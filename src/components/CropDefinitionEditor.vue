@@ -3,124 +3,98 @@ import { ref, watch, computed, onUnmounted } from 'vue';
 import { storeToRefs } from 'pinia';
 import { useCropStore } from '@/stores/cropStore';
 import { detectLargestFace } from '@/services/faceDetector';
+import { calculatePixelCropBox } from '@/utils/cropUtils'; // Import the new utility
 import ImagePreview from './ImagePreview.vue';
-import type { CropParams } from '@/types'; // Make sure CropParams can't be null here
+import type { CropParams, FaceDetectionResult } from '@/types'; // CropParams is now percentage based
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Loader2 } from 'lucide-vue-next';
 
 const store = useCropStore();
+// definedCropParams from store IS the percentage-based object
 const { templateImageUrl, templateFaceResult, definedCropParams } = storeToRefs(store);
 
-// Initialize localCropParams from the store or use defaults.
-// Ensure localCropParams always holds a CropParams object, not null.
-const initialCropParams = definedCropParams.value
-  ? { ...definedCropParams.value }
-  : { top: 100, right: 100, bottom: 100, left: 100 };
-const localCropParams = ref<CropParams>({ ...initialCropParams }); // Always a full object
+// localCropParams directly reflects the structure of definedCropParams from the store
+// Initialize with a deep copy from the store's current value
+const localCropParams = ref<CropParams>({ ...definedCropParams.value });
 
 const detectionError = ref<string | null>(null);
 const isDetecting = ref(false);
-
 const imageElementForDetection = new Image();
 
-// Watcher 1: Local UI changes (localCropParams) -> update store
+// Watcher 1: Local UI (localCropParams) changes -> update store
 watch(localCropParams, (newLocalParams) => {
-  // console.log('localCropParams changed, updating store:', newLocalParams);
-  store.setCropParams({ ...newLocalParams }); // Send a fresh copy to the store
+  // Only update the store if the params are actually different,
+  // to prevent potential recursive updates if store updates trigger this watcher.
+  if (JSON.stringify(newLocalParams) !== JSON.stringify(definedCropParams.value)) {
+    store.setCropParams({ ...newLocalParams }); // Send a fresh copy
+  }
 }, { deep: true });
 
-// Watcher 2: Store changes (definedCropParams) -> update local UI (localCropParams)
+// Watcher 2: Store (definedCropParams) changes -> update local UI (localCropParams)
 watch(definedCropParams, (newStoreParams) => {
-  if (newStoreParams) {
-    // console.log('definedCropParams from store changed:', newStoreParams);
-    // Only update localCropParams if the values are actually different
-    if (
-      localCropParams.value.top !== newStoreParams.top ||
-      localCropParams.value.right !== newStoreParams.right ||
-      localCropParams.value.bottom !== newStoreParams.bottom ||
-      localCropParams.value.left !== newStoreParams.left
-    ) {
-      // console.log('Store is different, updating localCropParams.');
-      localCropParams.value = { ...newStoreParams };
-    }
+  // Only update local if the store's value is actually different from local,
+  // to prevent potential recursive updates.
+  if (newStoreParams && JSON.stringify(newStoreParams) !== JSON.stringify(localCropParams.value)) {
+    localCropParams.value = { ...newStoreParams };
   }
-  // If newStoreParams is null, localCropParams retains its current value or you could reset to defaults:
-  // else { localCropParams.value = { top: 100, right: 100, bottom: 100, left: 100 }; }
 }, { deep: true });
 
+watch(templateImageUrl, async (newUrl) => {
+    if (newUrl) {
+        isDetecting.value = true;
+        detectionError.value = null;
+        store.setTemplateFaceResult(null); // Clear previous face result
 
-watch(templateImageUrl, async (newUrl, oldUrl) => {
-  // console.log(`templateImageUrl watcher: new=${newUrl}, old=${oldUrl}`);
-  if (newUrl) {
-    // Prevent re-processing if the URL hasn't actually changed,
-    // unless explicitly needed (e.g. forcing re-detection).
-    // if (newUrl === oldUrl && !isDetecting.value && (templateFaceResult.value || detectionError.value)) return;
-
-    isDetecting.value = true;
-    detectionError.value = null;
-    store.setTemplateFaceResult(null); // Clear previous result
-
-    imageElementForDetection.onload = async () => {
-      // console.log('Image loaded for detection:', newUrl);
-      try {
-        const faceResult = await detectLargestFace(imageElementForDetection);
-        store.setTemplateFaceResult(faceResult); // This will update templateFaceResult
-        if (!faceResult) {
-          detectionError.value = "No face detected in the template image. Please try another one.";
-        }
-      } catch (error: any) {
-        console.error("Face detection failed:", error);
-        detectionError.value = `Face detection service failed: ${error.message || 'Unknown error'}`;
-      } finally {
-        isDetecting.value = false;
-      }
-    };
-    imageElementForDetection.onerror = () => {
-      // This is line 47 referenced in your error
-      // console.error("Failed to load template image for detection in imageElement.onerror:", newUrl);
-      detectionError.value = "Error: Failed to load the template image for processing. The file might be corrupted or an invalid image format.";
-      isDetecting.value = false;
-      store.setTemplateFaceResult(null); // Ensure face result is cleared
-    };
-
-    imageElementForDetection.src = ''; // Reset src before setting it again, might help with some browser caching issues
-    imageElementForDetection.src = newUrl; // Start loading
-    // console.log("Set imageElementForDetection.src to:", newUrl);
-
-  } else { // newUrl is null or undefined
-    // console.log("templateImageUrl is now null/undefined in watcher.");
-    store.setTemplateFaceResult(null);
-    isDetecting.value = false;
-    detectionError.value = null;
-    if (imageElementForDetection) imageElementForDetection.src = ''; // Clear src
-  }
-}, { immediate: true }); // `immediate: true` runs this watcher when the component is mounted
-
-const naturalImageDimensions = computed(() => {
-    // Use templateFaceResult which stores these from detection
-    if (store.templateFaceResult) {
-        return {
-            width: store.templateFaceResult.imageWidth,
-            height: store.templateFaceResult.imageHeight
+        imageElementForDetection.onload = async () => {
+            try {
+                const faceResult = await detectLargestFace(imageElementForDetection);
+                store.setTemplateFaceResult(faceResult); // This updates reactive templateFaceResult
+                if (!faceResult) {
+                    detectionError.value = "No face detected in the template image. Please try another one.";
+                }
+            } catch (error: any) {
+                console.error("Face detection failed in CropDefinitionEditor:", error);
+                detectionError.value = `Face detection service failed: ${error.message || 'Unknown error'}`;
+            } finally {
+                isDetecting.value = false;
+            }
         };
+        imageElementForDetection.onerror = () => {
+            detectionError.value = "Error: Failed to load the template image for processing. The file might be corrupted or an invalid image format.";
+            isDetecting.value = false;
+            store.setTemplateFaceResult(null);
+        };
+        imageElementForDetection.src = ''; // Reset src before setting it again
+        imageElementForDetection.src = newUrl;
+    } else {
+        store.setTemplateFaceResult(null);
+        isDetecting.value = false;
+        detectionError.value = null;
+        if (imageElementForDetection) imageElementForDetection.src = '';
     }
-    // Fallback if image loaded but no face, or if image failed to load (less accurate)
-    else if (imageElementForDetection.complete && imageElementForDetection.naturalWidth > 0) {
-      return {
-        width: imageElementForDetection.naturalWidth,
-        height: imageElementForDetection.naturalHeight
-      }
-    }
-    return null;
+}, { immediate: true });
+
+
+// This computed property calculates the *actual pixel crop box* for the preview
+const previewPixelCropBox = computed(() => {
+  if (templateFaceResult.value && templateFaceResult.value.boundingBox && localCropParams.value) {
+    return calculatePixelCropBox(
+      templateFaceResult.value.boundingBox,
+      localCropParams.value, // These are the percentage-based params from user input
+      templateFaceResult.value.imageWidth,
+      templateFaceResult.value.imageHeight
+    );
+  }
+  return null;
 });
 
 onUnmounted(() => {
     if (imageElementForDetection) {
         imageElementForDetection.onload = null;
         imageElementForDetection.onerror = null;
-        imageElementForDetection.src = ''; // Prevent memory leaks or continued loading
+        imageElementForDetection.src = '';
     }
 });
 
@@ -129,51 +103,66 @@ onUnmounted(() => {
 <template>
   <div class="space-y-4">
     <ImagePreview
-      v-if="templateImageUrl"
+      v-if="templateImageUrl && templateFaceResult"
       :image-url="templateImageUrl"
       :face-result="templateFaceResult"
-      :crop-params="localCropParams"
-      :image-width="naturalImageDimensions?.width"
-      :image-height="naturalImageDimensions?.height"
+      :pixel-crop-box-to-draw="previewPixelCropBox"
     />
-
-    <Alert v-if="isDetecting" variant="default">
-      <Loader2 class="h-4 w-4 animate-spin" />
-      <AlertTitle>Detecting Face</AlertTitle>
-      <AlertDescription>
-        Please wait while we analyze the template image...
-    </AlertDescription>
+    <div v-else-if="templateImageUrl && isDetecting" class="w-full aspect-video bg-slate-200 dark:bg-slate-700 rounded flex items-center justify-center">
+        <Loader2 class="h-8 w-8 animate-spin text-primary" />
+        <p class="ml-2">Detecting face...</p>
+    </div>
+     <Alert v-else-if="templateImageUrl && !isDetecting && !templateFaceResult" variant="default">
+        <AlertTitle>No Face Detected or Error</AlertTitle>
+        <AlertDescription>
+            {{ detectionError || "Could not detect a face in the template image. Please try a different image." }}
+        </AlertDescription>
     </Alert>
 
-    <Alert v-if="detectionError && !isDetecting" variant="destructive">
-      <AlertTitle>Detection Error</AlertTitle>
+
+    <Alert v-if="isDetecting" variant="default" class="mt-4">
+      <Loader2 class="h-4 w-4 animate-spin" />
+      <AlertTitle>Analyzing Template</AlertTitle>
+      <AlertDescription>
+        Detecting face in the template image...
+      </AlertDescription>
+    </Alert>
+
+    <Alert v-if="!isDetecting && detectionError" variant="destructive" class="mt-4">
+      <AlertTitle>Detection Problem</AlertTitle>
       <AlertDescription>{{ detectionError }}</AlertDescription>
     </Alert>
 
-    <Alert v-if="!isDetecting && templateImageUrl && templateFaceResult && templateFaceResult.detectionCount > 1" variant="default">
-    <AlertTitle>Multiple Faces Detected</AlertTitle>
-    <AlertDescription>
-        {{ templateFaceResult.detectionCount }} faces were found in the template image. The largest face (highlighted in red) will be used as the reference for cropping.
-    </AlertDescription>
-</Alert>
+    <Alert v-if="!isDetecting && templateFaceResult && templateFaceResult.detectionCount > 1" variant="default" class="mt-4">
+        <AlertTitle>Multiple Faces Detected</AlertTitle>
+        <AlertDescription>
+            {{ templateFaceResult.detectionCount }} faces were found. The largest face (outlined in red) is used as the reference for cropping.
+        </AlertDescription>
+    </Alert>
 
-    <div v-if="templateFaceResult" class="grid grid-cols-2 md:grid-cols-4 gap-4">
+    <div v-if="templateFaceResult" class="grid grid-cols-2 md:grid-cols-4 gap-4 mt-4">
       <div>
-        <Label for="crop-top">Top (px)</Label>
-        <Input id="crop-top" type="number" v-model.number="localCropParams.top" min="0" />
+        <Label for="crop-top-percent">Top Padding (%)</Label>
+        <Input id="crop-top-percent" type="number" v-model.number="localCropParams.topPaddingPercent" min="0" placeholder="e.g., 25" />
       </div>
       <div>
-        <Label for="crop-bottom">Bottom (px)</Label>
-        <Input id="crop-bottom" type="number" v-model.number="localCropParams.bottom" min="0" />
+        <Label for="crop-bottom-percent">Bottom Padding (%)</Label>
+        <Input id="crop-bottom-percent" type="number" v-model.number="localCropParams.bottomPaddingPercent" min="0" placeholder="e.g., 25" />
       </div>
       <div>
-        <Label for="crop-left">Left (px)</Label>
-        <Input id="crop-left" type="number" v-model.number="localCropParams.left" min="0" />
+        <Label for="crop-left-percent">Left Padding (%)</Label>
+        <Input id="crop-left-percent" type="number" v-model.number="localCropParams.leftPaddingPercent" min="0" placeholder="e.g., 50" />
       </div>
       <div>
-        <Label for="crop-right">Right (px)</Label>
-        <Input id="crop-right" type="number" v-model.number="localCropParams.right" min="0" />
+        <Label for="crop-right-percent">Right Padding (%)</Label>
+        <Input id="crop-right-percent" type="number" v-model.number="localCropParams.rightPaddingPercent" min="0" placeholder="e.g., 50" />
       </div>
     </div>
+     <Alert v-else-if="templateImageUrl && !isDetecting" variant="default" class="mt-4">
+        <AlertTitle>Define Crop Area</AlertTitle>
+        <AlertDescription>
+            If a face is detected (outlined in red), you can adjust the percentage-based padding around it using the controls above. These settings will be applied to all batch images.
+        </AlertDescription>
+    </Alert>
   </div>
 </template>

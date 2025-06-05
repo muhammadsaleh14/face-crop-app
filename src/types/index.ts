@@ -1,24 +1,26 @@
 // src/types/index.ts
-export interface FaceDetectionResult {
-  center: { x: number; y: number };
-  boundingBox: { x: number; y: number; width: number; height: number };
-  imageWidth: number; // Natural width of the original image
-  imageHeight: number; // Natural height of the original image
-  detectionCount: number; // Total number of faces detected in the image
+export interface CropParams {
+  leftPaddingPercent: number // e.g., 50 means 50% of face width
+  rightPaddingPercent: number // e.g., 50 means 50% of face width
+  topPaddingPercent: number // e.g., 25 means 25% of face height
+  bottomPaddingPercent: number // e.g., 25 means 25% of face height
 }
 
-export interface CropParams {
-  top: number;
-  right: number;
-  bottom: number;
-  left: number;
+// FaceDetectionResult and BatchImageFile remain the same
+export interface FaceDetectionResult {
+  center: { x: number; y: number } // Still useful for other things, or drawing a marker
+  boundingBox: { x: number; y: number; width: number; height: number } // Crucial for the new logic
+  imageWidth: number
+  imageHeight: number
+  detectionCount: number
 }
 
 export interface BatchImageFile {
-  id: string;
-  file: File;
-  originalUrl?: string; // Object URL for preview on main thread
-  status: 'pending' | 'processing' | 'cropped' | 'skipped';
-  croppedBlob?: Blob;
-  skippedReason?: string;
+  // ... same as before
+  id: string
+  file: File
+  originalUrl?: string
+  status: 'pending' | 'processing' | 'cropped' | 'skipped'
+  croppedBlob?: Blob
+  skippedReason?: string
 }

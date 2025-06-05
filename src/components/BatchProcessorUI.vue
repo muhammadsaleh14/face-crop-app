@@ -1,20 +1,20 @@
 <script setup lang="ts">
-import { onMounted, computed } from 'vue'
+import { ref, onMounted, onUnmounted, watch, computed } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useCropStore } from '@/stores/cropStore'
 import { detectLargestFace } from '@/services/faceDetector'
-// cropImage function will be executed IN THE WORKER
+import { calculatePixelCropBox } from '@/utils/cropUtils' // For calculating final crop pixels
 import { createZip, triggerZipDownload } from '@/services/zipService'
-import type { BatchImageFile } from '@/types'
+import type { BatchImageFile, FaceDetectionResult } from '@/types'
 
 import { Button } from '@/components/ui/button'
-import { Progress } from '@/components/ui/progress' // Shadcn-vue
-import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
-import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card' // Shadcn-vue
-import { ScrollArea } from '@/components/ui/scroll-area' // Shadcn-vue
+import { Progress } from '@/components/ui/progress'
+import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card'
+import { ScrollArea } from '@/components/ui/scroll-area'
 import { Loader2 } from 'lucide-vue-next'
 
 const store = useCropStore()
+// definedCropParams from store ARE the percentage-based params
 const {
   batchImages,
   definedCropParams,
@@ -23,11 +23,13 @@ const {
   skippedImageInfos,
 } = storeToRefs(store)
 
-const MAX_WORKERS = navigator.hardwareConcurrency || 4 // Use available cores, default to 4
+const MAX_WORKERS = navigator.hardwareConcurrency || 4
 const workers: Worker[] = []
-let imageQueue: BatchImageFile[] = []
-let activeWorkers = 0
-const activeImageObjectURLs = new Map<string, string>()
+let imageQueue: BatchImageFile[] = [] // Queue of images waiting for a worker
+let activeWorkersCount = 0 // Count of workers currently busy
+
+// Map to store Object URLs for images sent to workers, to revoke them later
+const activeImageObjectURLs = new Map<string, string>() // filename -> objectURL
 
 const overallProgress = computed(() => {
   if (batchImages.value.length === 0) return 0
@@ -38,66 +40,44 @@ const overallProgress = computed(() => {
 })
 
 function initializeWorkers() {
+  if (workers.length > 0) return // Already initialized
+
   for (let i = 0; i < MAX_WORKERS; i++) {
-    // Ensure worker path is correct from public folder
     const worker = new Worker(new URL('/cropWorker.js', import.meta.url), { type: 'module' })
     worker.onmessage = (event) => {
       const { status, blob, filename, error: workerError } = event.data
-      const originalFile = batchImages.value.find((f) => f.file.name === filename) // Find by original filename
+      const originalBatchFile = batchImages.value.find((f) => f.file.name === filename)
 
-      // Revoke the Object URL
       const objectURLToRevoke = activeImageObjectURLs.get(filename)
       if (objectURLToRevoke) {
         URL.revokeObjectURL(objectURLToRevoke)
         activeImageObjectURLs.delete(filename)
       }
 
-      if (originalFile) {
+      if (originalBatchFile) {
         if (status === 'cropped') {
-          store.updateBatchImageStatus(originalFile.id, 'cropped', blob)
+          store.updateBatchImageStatus(originalBatchFile.id, 'cropped', blob)
         } else {
           store.updateBatchImageStatus(
-            originalFile.id,
+            originalBatchFile.id,
             'skipped',
             undefined,
             workerError || 'Worker processing failed',
           )
         }
       }
-      activeWorkers--
-      processNextImageFromQueue()
+      activeWorkersCount--
+      processNextImageFromQueue() // Try to process another image
     }
     worker.onerror = (error) => {
-      console.error('Worker setup error:', error)
-      // This onerror is for setup issues with the worker itself,
-      // not for errors from onmessage (which are handled above).
-      // We need a way to link this back to a specific file if a task was ongoing.
-      // For now, let's assume this is a general worker error.
-      // If there was an active task for this worker, try to mark it as skipped.
-      // This part is a bit tricky to attribute without more state.
-
-      // Simplistic: if a worker dies, try to find an image marked as "processing"
-      // that hasn't completed and mark it as skipped.
-      const processingImage = batchImages.value.find(
-        (img) => img.status === 'processing' && !activeImageObjectURLs.has(img.file.name),
-      )
-      if (processingImage) {
-        // Revoke if we can find its URL (might not be in activeImageObjectURLs if error was very early)
-        const urlToRevoke = activeImageObjectURLs.get(processingImage.file.name)
-        if (urlToRevoke) {
-          URL.revokeObjectURL(urlToRevoke)
-          activeImageObjectURLs.delete(processingImage.file.name)
-        }
-        store.updateBatchImageStatus(
-          processingImage.id,
-          'skipped',
-          undefined,
-          `Worker failed unexpectedly: ${error.message}`,
-        )
-      }
-
-      activeWorkers--
-      processNextImageFromQueue() // Attempt to continue with other workers/images
+      console.error('Worker instance error (onerror):', error)
+      // This indicates a more fundamental issue with a worker instance.
+      // Try to find an image that might have been "stuck" with this worker.
+      // This is hard to attribute perfectly.
+      // For simplicity, we just decrement and try to continue.
+      // A more robust system might try to re-queue the "lost" task.
+      activeWorkersCount--
+      processNextImageFromQueue()
     }
     workers.push(worker)
   }
@@ -108,82 +88,104 @@ async function processBatch() {
     alert('Crop parameters not set or no batch images.')
     return
   }
-  store.startBatchProcessing()
-  imageQueue = [...batchImages.value.filter((img) => img.status === 'pending')] // Get pending images
+  if (isProcessingBatch.value) return
 
-  // Start processing with available workers
+  store.startBatchProcessing() // Resets counts and sets isProcessingBatch
+  imageQueue = [
+    ...batchImages.value.filter((img) => img.status === 'pending' || img.status === 'processing'),
+  ] // Re-queue if some were stuck
+
   for (let i = 0; i < MAX_WORKERS; i++) {
-    processNextImageFromQueue()
+    if (activeWorkersCount < MAX_WORKERS) {
+      // Check before calling
+      processNextImageFromQueue()
+    }
   }
 }
 
 async function processNextImageFromQueue() {
   if (imageQueue.length === 0) {
-    if (activeWorkers === 0) {
+    if (activeWorkersCount === 0) {
+      // All images processed and all workers idle
       store.finishBatchProcessing()
-      console.log('Batch processing complete.')
     }
-    return
+    return // No more images in queue
   }
 
-  if (activeWorkers >= MAX_WORKERS) {
-    return // All workers busy
+  if (activeWorkersCount >= MAX_WORKERS) {
+    return // All workers are currently busy
   }
 
-  const batchFile = imageQueue.shift()
-  if (!batchFile || !definedCropParams.value) return
+  const batchFile = imageQueue.shift() // Get next image from queue
+  if (!batchFile) return // Should not happen if queue wasn't empty
 
-  activeWorkers++
+  activeWorkersCount++
   store.updateBatchImageStatus(batchFile.id, 'processing')
 
   try {
-    // Perform face detection on the main thread
     const imageElement = await loadImageToElement(batchFile.file)
-    const faceResult = await detectLargestFace(imageElement)
+    const faceResult: FaceDetectionResult | null = await detectLargestFace(imageElement)
 
-    if (faceResult && faceResult.center && definedCropParams.value) {
-      // Add null check for definedCropParams.value
-      const imageDataUrl = URL.createObjectURL(batchFile.file)
-      activeImageObjectURLs.set(batchFile.file.name, imageDataUrl)
+    if (faceResult && faceResult.boundingBox && definedCropParams.value) {
+      const pixelCropSourceBox = calculatePixelCropBox(
+        faceResult.boundingBox,
+        definedCropParams.value, // These are the percentage-based params
+        imageElement.naturalWidth,
+        imageElement.naturalHeight,
+      )
 
-      // THE FIX for DataCloneError:
-      const plainCropParams = { ...definedCropParams.value } // Create a plain JS object
+      if (pixelCropSourceBox) {
+        const imageDataUrl = URL.createObjectURL(batchFile.file)
+        activeImageObjectURLs.set(batchFile.file.name, imageDataUrl)
 
-      const worker = workers[activeWorkers % MAX_WORKERS] // Or your worker selection logic
-      worker.postMessage({
-        imageDataUrl,
-        faceCenterX: faceResult.center.x,
-        faceCenterY: faceResult.center.y,
-        cropParams: plainCropParams, // Use the plain object copy
-        outputFormat: 'image/png',
-        quality: 0.9,
-        filename: batchFile.file.name,
-        imageNaturalWidth: imageElement.naturalWidth,
-        imageNaturalHeight: imageElement.naturalHeight,
-      })
-      // Consider revoking imageDataUrl after worker is done or if it errors.
-      // A simple way: worker.onmessage = (event) => { ... URL.revokeObjectURL(imageDataUrl); activeWorkers--; ... }
-      // worker.onerror = (event) => { ... URL.revokeObjectURL(imageDataUrl); activeWorkers--; ... }
-      // However, this means the worker message needs to echo back enough info to find the URL.
-      // Or, store these temporary URLs in a map and clear them.
-      // For now, existing logic revokes `batchFile.originalUrl` on `clearBatch`,
-      // which might be sufficient if `imageDataUrl` is same as `batchFile.originalUrl`.
-      // If not, you'll need to manage `imageDataUrl` revocation more carefully.
-      // Let's assume batchFile.originalUrl IS the imageDataUrl for simplicity or that current revocation is enough for now.
-    } else {
-      let reason = 'No face detected'
-      if (!definedCropParams.value) {
-        reason = 'Crop parameters not defined'
+        // Find an available worker (the first one not tracked by activeWorkersCount is simplest way)
+        // This assumes workers are roughly equivalent. A true pool might be better.
+        const workerToUse = workers[activeWorkersCount - (1 % MAX_WORKERS)] // % workers.length
+        if (!workerToUse) {
+          // Should not happen if workers are initialized
+          throw new Error('No available worker found.')
+        }
+
+        workerToUse.postMessage({
+          imageDataUrl,
+          sourceX: pixelCropSourceBox.x,
+          sourceY: pixelCropSourceBox.y,
+          sourceWidth: pixelCropSourceBox.width,
+          sourceHeight: pixelCropSourceBox.height,
+          outputWidth: pixelCropSourceBox.width,
+          outputHeight: pixelCropSourceBox.height,
+          outputFormat: 'image/png',
+          quality: 0.9,
+          filename: batchFile.file.name,
+        })
+      } else {
+        // Crop box calculation failed (e.g., zero size, face too close to edge with large padding)
+        store.updateBatchImageStatus(
+          batchFile.id,
+          'skipped',
+          undefined,
+          'Calculated crop dimensions were invalid',
+        )
+        activeWorkersCount-- // Worker was not used
+        processNextImageFromQueue() // Try next image
       }
+    } else {
+      let reason = 'No face detected or face data incomplete'
+      if (!definedCropParams.value) reason = 'Crop parameters not defined (should not happen)'
       store.updateBatchImageStatus(batchFile.id, 'skipped', undefined, reason)
-      activeWorkers--
-      processNextImageFromQueue()
+      activeWorkersCount-- // Worker was not used
+      processNextImageFromQueue() // Try next image
     }
-  } catch (error) {
-    console.error(`Error processing ${batchFile.file.name}:`, error)
-    store.updateBatchImageStatus(batchFile.id, 'skipped', undefined, `Error: ${error}`)
-    activeWorkers-- // Decrement as this path failed before worker dispatch
-    processNextImageFromQueue()
+  } catch (error: any) {
+    console.error(`Error processing ${batchFile.file.name} on main thread:`, error)
+    store.updateBatchImageStatus(
+      batchFile.id,
+      'skipped',
+      undefined,
+      `Main thread error: ${error.message}`,
+    )
+    activeWorkersCount-- // Worker was not used
+    processNextImageFromQueue() // Try next image
   }
 }
 
@@ -193,10 +195,16 @@ function loadImageToElement(file: File): Promise<HTMLImageElement> {
     reader.onload = (e) => {
       const img = new Image()
       img.onload = () => resolve(img)
-      img.onerror = reject
+      img.onerror = (errEvent) => {
+        console.error('Failed to load image into HTMLImageElement:', errEvent)
+        reject(new Error('Failed to load image file for processing.'))
+      }
       img.src = e.target?.result as string
     }
-    reader.onerror = reject
+    reader.onerror = (errEvent) => {
+      console.error('FileReader error:', errEvent)
+      reject(new Error('FileReader failed to read the image file.'))
+    }
     reader.readAsDataURL(file)
   })
 }
@@ -205,7 +213,7 @@ async function handleDownloadZip() {
   const filesToZip = batchImages.value
     .filter((img) => img.status === 'cropped' && img.croppedBlob)
     .map((img) => ({
-      filename: `cropped_${img.file.name}`, // Add prefix or change extension
+      filename: `cropped_${img.file.name.split('.').slice(0, -1).join('.') || img.file.name}.png`, // Enforce png for now
       blob: img.croppedBlob!,
     }))
 
@@ -225,19 +233,15 @@ async function handleDownloadZip() {
 
 onMounted(() => {
   initializeWorkers()
-  // If returning to this step with pending images, an option to auto-start or manual start
-  // if (batchImages.value.some(img => img.status === 'pending') && !isProcessingBatch.value) {
-  //   processBatch(); // Or require a button click
-  // }
 })
 
-// Clean up workers when component is unmounted
-// onUnmounted(() => {
-//   workers.forEach(worker => worker.terminate());
-// });
-// Terminating workers on unmount can be problematic if App.vue structure re-renders this component often.
-// Better to initialize once and keep them, or manage lifecycle carefully.
-// For this app, since it's a distinct step, it might be okay.
+onUnmounted(() => {
+  // Terminate workers and clear object URLs if any are left (though they should be cleared by worker messages)
+  workers.forEach((worker) => worker.terminate())
+  workers.length = 0 // Clear the array
+  activeImageObjectURLs.forEach((url) => URL.revokeObjectURL(url))
+  activeImageObjectURLs.clear()
+})
 </script>
 
 <template>
@@ -248,50 +252,43 @@ onMounted(() => {
       class="w-full"
     >
       <Loader2 v-if="isProcessingBatch" class="mr-2 h-4 w-4 animate-spin" />
-      {{ isProcessingBatch ? 'Processing...' : 'Start Batch Processing' }}
+      {{
+        isProcessingBatch
+          ? `Processing ${activeWorkersCount} / ${batchImages.length}...`
+          : 'Start Batch Processing'
+      }}
     </Button>
 
-    <div v-if="batchImages.length > 0">
-      <h3 class="text-lg font-medium mb-2">Processing Progress</h3>
+    <div v-if="batchImages.length > 0 || isProcessingBatch">
+      <h3 class="text-lg font-medium mb-2">Overall Progress</h3>
       <Progress :model-value="overallProgress" class="w-full" />
       <p class="text-sm text-slate-600 dark:text-slate-400 mt-1">
-        {{ successfullyCroppedCount }} cropped / {{ skippedImageInfos.length }} skipped /
+        {{ batchImages.filter((img) => img.status === 'cropped').length }} cropped /
+        {{ batchImages.filter((img) => img.status === 'skipped').length }} skipped /
         {{ batchImages.length }} total
       </p>
     </div>
 
-    <Card v-if="isProcessingBatch || skippedImageInfos.length > 0 || successfullyCroppedCount > 0">
+    <Card
+      v-if="!isProcessingBatch && (skippedImageInfos.length > 0 || successfullyCroppedCount > 0)"
+    >
       <CardHeader>
-        <CardTitle>Processing Summary</CardTitle>
-        <CardDescription>Status of the batch processing.</CardDescription>
+        <CardTitle>Batch Processing Complete</CardTitle>
+        <CardDescription>
+          {{ successfullyCroppedCount }} image(s) successfully cropped.
+          {{ skippedImageInfos.length }} image(s) were skipped.
+        </CardDescription>
       </CardHeader>
-      <CardContent>
-        <p v-if="isProcessingBatch && overallProgress < 100">Processing... please wait.</p>
-        <div
-          v-if="
-            !isProcessingBatch && (skippedImageInfos.length > 0 || successfullyCroppedCount > 0)
-          "
-        >
-          <Alert variant="default" class="mb-4">
-            <AlertTitle>Batch Processing Complete!</AlertTitle>
-            <AlertDescription>
-              {{ successfullyCroppedCount }} image(s) successfully cropped. <br />
-              {{ skippedImageInfos.length }} image(s) were skipped.
-            </AlertDescription>
-          </Alert>
-
-          <div v-if="skippedImageInfos.length > 0">
-            <h4 class="font-semibold mb-2">Skipped Images:</h4>
-            <ScrollArea class="h-40 w-full rounded-md border p-2 bg-slate-50 dark:bg-slate-700">
-              <ul>
-                <li v-for="(skipped, index) in skippedImageInfos" :key="index" class="text-sm py-1">
-                  <strong>{{ skipped.filename }}</strong
-                  >: {{ skipped.reason }}
-                </li>
-              </ul>
-            </ScrollArea>
-          </div>
-        </div>
+      <CardContent v-if="skippedImageInfos.length > 0">
+        <h4 class="font-semibold mb-2">Details for Skipped Images:</h4>
+        <ScrollArea class="h-40 w-full rounded-md border p-2 bg-slate-50 dark:bg-slate-700">
+          <ul>
+            <li v-for="(skipped, index) in skippedImageInfos" :key="index" class="text-sm py-1">
+              <strong>{{ skipped.filename }}</strong
+              >: {{ skipped.reason }}
+            </li>
+          </ul>
+        </ScrollArea>
       </CardContent>
     </Card>
 
@@ -309,7 +306,7 @@ onMounted(() => {
       variant="destructive"
       class="w-full mt-2"
     >
-      Clear Batch & Start New
+      Clear Current Batch
     </Button>
   </div>
 </template>
