@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "deploy": "npm run build && gh-pages -d dist", 
+    "build": "run-p type-check \"build-only {@}\" --",
+    "deploy": "npm run build && gh-pages -d dist",
     "preview": "vite preview",
     "test:unit": "vitest",
     "test:e2e": "playwright test",
