@@ -5,22 +5,32 @@ export interface CropParams {
   topPaddingPercent: number // e.g., 25 means 25% of face height
   bottomPaddingPercent: number // e.g., 25 means 25% of face height
 }
+export interface BoundingBox {
+  // Renamed from PixelBoundingBox for clarity
+  x: number
+  y: number
+  width: number
+  height: number
+}
 
 // FaceDetectionResult and BatchImageFile remain the same
 export interface FaceDetectionResult {
-  center: { x: number; y: number } // Still useful for other things, or drawing a marker
-  boundingBox: { x: number; y: number; width: number; height: number } // Crucial for the new logic
+  primaryBoundingBox: BoundingBox | null // The largest face, or a selected one for the template
+  allDetectedBoundingBoxes: BoundingBox[] // All faces found
   imageWidth: number
   imageHeight: number
-  detectionCount: number
+  detectionCount: number // Total number of valid bounding boxes found
 }
 
 export interface BatchImageFile {
-  // ... same as before
   id: string
   file: File
   originalUrl?: string
-  status: 'pending' | 'processing' | 'cropped' | 'skipped'
-  croppedBlob?: Blob
+  status: 'pending' | 'processing' | 'cropped' | 'skipped' | 'error' // Added 'error'
+  // For batch processing, we might store the full detection result
+  // to avoid re-detecting faces if we enhance the review step later.
+  // For now, BatchProcessorUI will call detectAllFaces.
+  croppedBlobs?: { blob: Blob; filenameSuffix: string }[] // Array of blobs if multiple faces
   skippedReason?: string
+  errorMessage?: string // For critical errors during processing one image
 }

@@ -1,50 +1,92 @@
 // public/cropWorker.js
 self.onmessage = async (event) => {
   const {
-    imageDataUrl,
-    sourceX,         // Pixel value from main thread
-    sourceY,         // Pixel value from main thread
-    sourceWidth,     // Pixel value from main thread
-    sourceHeight,    // Pixel value from main thread
-    outputWidth,     // Pixel value from main thread (same as sourceWidth for this crop type)
-    outputHeight,    // Pixel value from main thread (same as sourceHeight for this crop type)
+    imageFile,
+    sourceX,
+    sourceY,
+    sourceWidth,
+    sourceHeight,
+    outputWidth,
+    outputHeight,
     outputFormat,
     quality,
     filename,
+    originalFileId,
+    faceIndex
   } = event.data;
 
+  // --- WORKER DEBUG LOGGING ---
+  console.log(`[Worker] Received task for: ${filename}, Face Index: ${faceIndex}, Original ID: ${originalFileId}`);
+  console.log(`[Worker] Crop Params: X:${sourceX}, Y:${sourceY}, W:${sourceWidth}, H:${sourceHeight}`);
+  console.log(`[Worker] Output Dims: W:${outputWidth}, H:${outputHeight}`);
+  if (!imageFile) {
+    console.error(`[Worker] FATAL: imageFile is undefined for ${filename}`);
+    self.postMessage({ status: 'error', error: 'imageFile was undefined in worker', filename, originalFileId, faceIndex });
+    return;
+  }
+  console.log(`[Worker] imageFile name: ${imageFile.name}, size: ${imageFile.size}, type: ${imageFile.type}`);
+
   try {
-    const response = await fetch(imageDataUrl);
-    if (!response.ok) throw new Error(`Failed to fetch image: ${response.status}`);
-    const imageBlob = await response.blob();
-    const imageBitmap = await createImageBitmap(imageBlob);
+    console.log(`[Worker] Attempting createImageBitmap for ${filename}...`);
+    const imageBitmap = await createImageBitmap(imageFile);
+    console.log(`[Worker] createImageBitmap SUCCESS for ${filename}. Dimensions: ${imageBitmap.width}x${imageBitmap.height}`);
 
     if (sourceWidth <= 0 || sourceHeight <= 0 || outputWidth <= 0 || outputHeight <= 0) {
+      console.error(`[Worker] Invalid crop dimensions for ${filename}:`, { sourceWidth, sourceHeight, outputWidth, outputHeight });
       throw new Error('Invalid crop dimensions received by worker.');
     }
 
-    const canvas = new OffscreenCanvas(outputWidth, outputHeight); // Use output dimensions
+    console.log(`[Worker] Creating OffscreenCanvas for ${filename}...`);
+    const canvas = new OffscreenCanvas(outputWidth, outputHeight);
     const ctx = canvas.getContext('2d');
-    if (!ctx) throw new Error('Failed to get 2D context from OffscreenCanvas');
+    if (!ctx) {
+      console.error(`[Worker] Failed to get 2D context for ${filename}`);
+      throw new Error('Failed to get 2D context from OffscreenCanvas');
+    }
+    console.log(`[Worker] OffscreenCanvas context obtained for ${filename}.`);
 
+    console.log(`[Worker] Drawing image to OffscreenCanvas for ${filename}...`);
     ctx.drawImage(
       imageBitmap,
       sourceX,
       sourceY,
       sourceWidth,
       sourceHeight,
-      0,               // destinationX (always 0 for the new canvas)
-      0,               // destinationY (always 0 for the new canvas)
-      outputWidth,     // destinationWidth
-      outputHeight     // destinationHeight
+      0,
+      0,
+      outputWidth,
+      outputHeight
     );
+    console.log(`[Worker] Image drawn for ${filename}. Closing bitmap.`);
 
     imageBitmap.close();
+
+    console.log(`[Worker] Converting canvas to blob for ${filename}...`);
     const blob = await canvas.convertToBlob({ type: outputFormat, quality: quality });
-    self.postMessage({ status: 'cropped', blob, filename });
+    console.log(`[Worker] Canvas converted to blob for ${filename}. Size: ${blob.size}`);
+
+    console.log(`[Worker] Posting 'cropped' message for ${filename}, Face: ${faceIndex}`);
+    self.postMessage({
+      status: 'cropped',
+      blob,
+      filename,
+      originalFileId,
+      faceIndex
+    });
 
   } catch (error) {
-    console.error('Worker error for', filename, ':', error);
-    self.postMessage({ status: 'error', error: error.message, filename });
+    // --- DETAILED WORKER ERROR LOGGING ---
+    console.error(`[Worker] CATCH BLOCK for ${filename}, Face Index: ${faceIndex}, Original ID: ${originalFileId}`);
+    console.error(`[Worker] Error message: ${error.message}`);
+    console.error(`[Worker] Error stack: ${error.stack}`);
+    console.error(`[Worker] Error object:`, error);
+
+    self.postMessage({
+      status: 'error',
+      error: error.message || 'Unknown worker error',
+      filename,
+      originalFileId,
+      faceIndex
+    });
   }
 };

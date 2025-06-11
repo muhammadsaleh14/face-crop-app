@@ -8,6 +8,35 @@ interface BoundingBox {
   height: number
 }
 
+// Add this new function to the existing file
+export function calculatePercentageParamsFromPixelBox(
+  faceBoundingBox: BoundingBox,
+  pixelCropBox: BoundingBox,
+): CropParams {
+  const { x: faceX, y: faceY, width: faceWidth, height: faceHeight } = faceBoundingBox
+
+  // Calculate pixel padding from the difference between the face box and the crop box
+  const pxLeftPadding = faceX - pixelCropBox.x
+  const pxRightPadding = (pixelCropBox.x + pixelCropBox.width) - (faceX + faceWidth)
+  const pxTopPadding = faceY - pixelCropBox.y
+  const pxBottomPadding = (pixelCropBox.y + pixelCropBox.height) - (faceY + faceHeight)
+
+  // Convert pixel padding to percentage of the face's dimensions
+  // Ensure we don't divide by zero if face dimensions are 0
+  const leftPaddingPercent = faceWidth > 0 ? (pxLeftPadding / faceWidth) * 100 : 0;
+  const rightPaddingPercent = faceWidth > 0 ? (pxRightPadding / faceWidth) * 100 : 0;
+  const topPaddingPercent = faceHeight > 0 ? (pxTopPadding / faceHeight) * 100 : 0;
+  const bottomPaddingPercent = faceHeight > 0 ? (pxBottomPadding / faceHeight) * 100 : 0;
+
+  return {
+    // Clamp to 0 to prevent negative padding values if box is dragged inside the face
+    leftPaddingPercent: Math.max(0, leftPaddingPercent),
+    rightPaddingPercent: Math.max(0, rightPaddingPercent),
+    topPaddingPercent: Math.max(0, topPaddingPercent),
+    bottomPaddingPercent: Math.max(0, bottomPaddingPercent),
+  }
+}
+
 export function calculatePixelCropBox(
   faceBoundingBox: BoundingBox,
   percentageParams: CropParams,

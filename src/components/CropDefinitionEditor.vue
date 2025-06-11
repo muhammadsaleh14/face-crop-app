@@ -2,145 +2,158 @@
 import { ref, watch, computed, onUnmounted } from 'vue';
 import { storeToRefs } from 'pinia';
 import { useCropStore } from '@/stores/cropStore';
-import { detectLargestFace } from '@/services/faceDetector';
-import { calculatePixelCropBox } from '@/utils/cropUtils'; // Import the new utility
+import { detectAllFaces } from '@/services/faceDetector';
+import { calculatePixelCropBox, calculatePercentageParamsFromPixelBox } from '@/utils/cropUtils';
 import ImagePreview from './ImagePreview.vue';
-import type { CropParams, FaceDetectionResult } from '@/types'; // CropParams is now percentage based
+import type { CropParams, FaceDetectionResult, BoundingBox } from '@/types';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
-import { Loader2 } from 'lucide-vue-next';
+import { Loader2, Info } from 'lucide-vue-next';
+
+// --- START DEBUG ---
+const DEBUG = true;
+const log = (...args: any[]) => DEBUG && console.log('[CropDefinitionEditor]', ...args);
+// --- END DEBUG ---
 
 const store = useCropStore();
-// definedCropParams from store IS the percentage-based object
 const { templateImageUrl, templateFaceResult, definedCropParams } = storeToRefs(store);
 
-// localCropParams directly reflects the structure of definedCropParams from the store
-// Initialize with a deep copy from the store's current value
 const localCropParams = ref<CropParams>({ ...definedCropParams.value });
-
 const detectionError = ref<string | null>(null);
 const isDetecting = ref(false);
 const imageElementForDetection = new Image();
 
-// Watcher 1: Local UI (localCropParams) changes -> update store
+const previewPixelCropBox = computed(() => {
+  if (templateFaceResult.value?.primaryBoundingBox && templateFaceResult.value.imageWidth > 0 && templateFaceResult.value.imageHeight > 0) {
+    return calculatePixelCropBox(
+      templateFaceResult.value.primaryBoundingBox,
+      localCropParams.value,
+      templateFaceResult.value.imageWidth,
+      templateFaceResult.value.imageHeight
+    );
+  }
+  log('previewPixelCropBox: Conditions not met', templateFaceResult.value);
+  return null;
+});
+
+const handleCropBoxUpdate = (newPixelBox: BoundingBox) => {
+    if (templateFaceResult.value?.primaryBoundingBox &&
+        templateFaceResult.value.imageWidth > 0 && // Ensure image dimensions are valid
+        templateFaceResult.value.imageHeight > 0) {
+        log('handleCropBoxUpdate: Received new pixel box from preview', newPixelBox);
+        const newPercentageParams = calculatePercentageParamsFromPixelBox(
+            templateFaceResult.value.primaryBoundingBox,
+            newPixelBox
+            // REMOVED: imageWidth and imageHeight are not needed by this function
+        );
+        log('handleCropBoxUpdate: Calculated new percentage params', newPercentageParams);
+        localCropParams.value = newPercentageParams;
+    } else {
+        log('handleCropBoxUpdate: No primary bounding box or invalid image dimensions to calculate from.');
+    }
+};
+
 watch(localCropParams, (newLocalParams) => {
-  // Only update the store if the params are actually different,
-  // to prevent potential recursive updates if store updates trigger this watcher.
   if (JSON.stringify(newLocalParams) !== JSON.stringify(definedCropParams.value)) {
-    store.setCropParams({ ...newLocalParams }); // Send a fresh copy
+    log('watch localCropParams: Updating store with new params', newLocalParams);
+    store.setCropParams({ ...newLocalParams });
   }
 }, { deep: true });
 
-// Watcher 2: Store (definedCropParams) changes -> update local UI (localCropParams)
 watch(definedCropParams, (newStoreParams) => {
-  // Only update local if the store's value is actually different from local,
-  // to prevent potential recursive updates.
   if (newStoreParams && JSON.stringify(newStoreParams) !== JSON.stringify(localCropParams.value)) {
+    log('watch definedCropParams: Updating local params from store', newStoreParams);
     localCropParams.value = { ...newStoreParams };
   }
 }, { deep: true });
 
 watch(templateImageUrl, async (newUrl) => {
+    log('watch templateImageUrl: New URL', newUrl);
     if (newUrl) {
         isDetecting.value = true;
         detectionError.value = null;
-        store.setTemplateFaceResult(null); // Clear previous face result
-
+        store.setTemplateFaceResult(null);
         imageElementForDetection.onload = async () => {
+            log('imageElementForDetection.onload: Image loaded in CropDefinitionEditor');
             try {
-                const faceResult = await detectLargestFace(imageElementForDetection);
-                store.setTemplateFaceResult(faceResult); // This updates reactive templateFaceResult
-                if (!faceResult) {
+                const faceResult: FaceDetectionResult | null = await detectAllFaces(imageElementForDetection);
+                log('imageElementForDetection.onload: Face detection result', faceResult);
+                store.setTemplateFaceResult(faceResult);
+                if (!faceResult || faceResult.detectionCount === 0) {
                     detectionError.value = "No face detected in the template image. Please try another one.";
+                    log('imageElementForDetection.onload: No face detected.');
+                } else if (faceResult.detectionCount > 1) {
+                    detectionError.value = null;
+                    log(`imageElementForDetection.onload: ${faceResult.detectionCount} faces detected.`);
+                } else {
+                    detectionError.value = null;
+                    log('imageElementForDetection.onload: 1 face detected.');
                 }
             } catch (error: any) {
-                console.error("Face detection failed in CropDefinitionEditor:", error);
                 detectionError.value = `Face detection service failed: ${error.message || 'Unknown error'}`;
-            } finally {
-                isDetecting.value = false;
+                log('imageElementForDetection.onload: Face detection error', error);
             }
+            finally { isDetecting.value = false; }
         };
         imageElementForDetection.onerror = () => {
-            detectionError.value = "Error: Failed to load the template image for processing. The file might be corrupted or an invalid image format.";
+            detectionError.value = "Error: Failed to load the template image for processing.";
             isDetecting.value = false;
             store.setTemplateFaceResult(null);
+            log('imageElementForDetection.onerror: Image load failed.');
         };
-        imageElementForDetection.src = ''; // Reset src before setting it again
+        imageElementForDetection.src = ''; // Reset src before setting it again for onload to trigger
         imageElementForDetection.src = newUrl;
     } else {
         store.setTemplateFaceResult(null);
         isDetecting.value = false;
         detectionError.value = null;
-        if (imageElementForDetection) imageElementForDetection.src = '';
+        if(imageElementForDetection) imageElementForDetection.src = '';
+        log('watch templateImageUrl: URL is null, cleared state.');
     }
 }, { immediate: true });
 
-
-// This computed property calculates the *actual pixel crop box* for the preview
-const previewPixelCropBox = computed(() => {
-  if (templateFaceResult.value && templateFaceResult.value.boundingBox && localCropParams.value) {
-    return calculatePixelCropBox(
-      templateFaceResult.value.boundingBox,
-      localCropParams.value, // These are the percentage-based params from user input
-      templateFaceResult.value.imageWidth,
-      templateFaceResult.value.imageHeight
-    );
-  }
-  return null;
-});
-
 onUnmounted(() => {
+    log('onUnmounted: Cleaning up CropDefinitionEditor');
     if (imageElementForDetection) {
         imageElementForDetection.onload = null;
         imageElementForDetection.onerror = null;
         imageElementForDetection.src = '';
     }
 });
-
 </script>
 
 <template>
   <div class="space-y-4">
     <ImagePreview
-      v-if="templateImageUrl && templateFaceResult"
+      v-if="templateImageUrl && templateFaceResult?.primaryBoundingBox"
       :image-url="templateImageUrl"
       :face-result="templateFaceResult"
       :pixel-crop-box-to-draw="previewPixelCropBox"
+      :interactive="true"
+      @update:crop-box="handleCropBoxUpdate"
     />
     <div v-else-if="templateImageUrl && isDetecting" class="w-full aspect-video bg-slate-200 dark:bg-slate-700 rounded flex items-center justify-center">
         <Loader2 class="h-8 w-8 animate-spin text-primary" />
         <p class="ml-2">Detecting face...</p>
     </div>
-     <Alert v-else-if="templateImageUrl && !isDetecting && !templateFaceResult" variant="default">
-        <AlertTitle>No Face Detected or Error</AlertTitle>
+     <Alert v-else-if="templateImageUrl && !isDetecting && (!templateFaceResult || templateFaceResult.detectionCount === 0)" variant="destructive">
+        <AlertTitle>Detection Problem</AlertTitle>
         <AlertDescription>
-            {{ detectionError || "Could not detect a face in the template image. Please try a different image." }}
+            {{ detectionError || "No face detected. Please try a different image or adjust lighting." }}
         </AlertDescription>
     </Alert>
 
-
-    <Alert v-if="isDetecting" variant="default" class="mt-4">
-      <Loader2 class="h-4 w-4 animate-spin" />
-      <AlertTitle>Analyzing Template</AlertTitle>
+    <Alert v-if="templateFaceResult && templateFaceResult.detectionCount > 1" variant="default" class="mt-4">
+      <Info class="h-4 w-4" />
+      <AlertTitle>Multiple Faces Detected in Template</AlertTitle>
       <AlertDescription>
-        Detecting face in the template image...
+        {{ templateFaceResult.detectionCount }} faces were found. The largest face (outlined in red) is
+        used to define the crop settings. When processing the batch, <strong>all detected faces</strong> in each batch image will be cropped individually.
       </AlertDescription>
     </Alert>
 
-    <Alert v-if="!isDetecting && detectionError" variant="destructive" class="mt-4">
-      <AlertTitle>Detection Problem</AlertTitle>
-      <AlertDescription>{{ detectionError }}</AlertDescription>
-    </Alert>
-
-    <Alert v-if="!isDetecting && templateFaceResult && templateFaceResult.detectionCount > 1" variant="default" class="mt-4">
-        <AlertTitle>Multiple Faces Detected</AlertTitle>
-        <AlertDescription>
-            {{ templateFaceResult.detectionCount }} faces were found. The largest face (outlined in red) is used as the reference for cropping.
-        </AlertDescription>
-    </Alert>
-
-    <div v-if="templateFaceResult" class="grid grid-cols-2 md:grid-cols-4 gap-4 mt-4">
+    <div v-if="templateFaceResult?.primaryBoundingBox" class="grid grid-cols-2 md:grid-cols-4 gap-4 mt-4">
       <div>
         <Label for="crop-top-percent">Top Padding (%)</Label>
         <Input id="crop-top-percent" type="number" v-model.number="localCropParams.topPaddingPercent" min="0" placeholder="e.g., 25" />
@@ -158,10 +171,11 @@ onUnmounted(() => {
         <Input id="crop-right-percent" type="number" v-model.number="localCropParams.rightPaddingPercent" min="0" placeholder="e.g., 50" />
       </div>
     </div>
-     <Alert v-else-if="templateImageUrl && !isDetecting" variant="default" class="mt-4">
+     <Alert v-else-if="templateImageUrl && !isDetecting && !templateFaceResult?.primaryBoundingBox" variant="default" class="mt-4">
         <AlertTitle>Define Crop Area</AlertTitle>
         <AlertDescription>
-            If a face is detected (outlined in red), you can adjust the percentage-based padding around it using the controls above. These settings will be applied to all batch images.
+            Once a face is detected (it will be outlined in red), you can adjust the percentage-based padding around it.
+            These settings will be applied to all batch images. If no face is detected, the crop definition controls will not appear.
         </AlertDescription>
     </Alert>
   </div>
