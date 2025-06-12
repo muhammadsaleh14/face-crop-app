@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { useHead } from '@vueuse/head' //
 import { ref, watch, nextTick } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useCropStore } from './stores/cropStore'
@@ -7,6 +8,26 @@ import CropDefinitionEditor from './components/CropDefinitionEditor.vue'
 import BatchProcessorUI from './components/BatchProcessorUI.vue'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+
+useHead({
+  title: 'Face-Centered Bulk Image Cropper | Automatic & Fast',
+  meta: [
+    {
+      name: 'description',
+      content: 'Quickly crop hundreds of images around detected faces. Define a crop template, upload a batch, and download a ZIP. Perfect for profile pictures and team photos. Free & private.'
+    },
+    // Open Graph (for social sharing like Facebook, LinkedIn)
+    { property: 'og:title', content: 'Face-Centered Bulk Image Cropper' },
+    { property: 'og:description', content: 'Automatically crop batch images around faces with custom padding.' },
+    { property: 'og:type', content: 'website' },
+    { property: 'og:image', content: 'https://YOUR_DOMAIN_HERE/social-preview.png' }, // IMPORTANT: We will create this
+    // Twitter Card
+    { name: 'twitter:card', content: 'summary_large_image' },
+    { name: 'twitter:title', content: 'Face-Centered Bulk Image Cropper' },
+    { name: 'twitter:description', content: 'Automatically crop batch images around faces with custom padding.' },
+    { name: 'twitter:image', content: 'https://YOUR_DOMAIN_HERE/social-preview.png' },
+  ],
+})
 
 const store = useCropStore()
 const { templateImage, batchImages } = storeToRefs(store)

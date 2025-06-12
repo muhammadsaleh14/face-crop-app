@@ -2,8 +2,12 @@ import { FilesetResolver, FaceDetector, type Detection } from '@mediapipe/tasks-
 import type { FaceDetectionResult, BoundingBox } from '@/types'
 
 let faceDetector: FaceDetector | null = null
-const DEBUG = true
-const log = (...args: any[]) => DEBUG && console.log('[FaceDetector]', ...args)
+
+const log = (...args: any[]) => {
+  if (import.meta.env.DEV) {
+    console.log('[CropDefinitionEditor]', ...args)
+  }
+}
 
 function getModelPath(modelFileName: string): string {
   const base = import.meta.env.BASE_URL
@@ -12,7 +16,7 @@ function getModelPath(modelFileName: string): string {
   return path
 }
 
-async function initializeFaceDetector(): Promise<void> {
+export async function initializeFaceDetector(): Promise<void> {
   if (faceDetector) return
   log('Initializing FaceDetector...')
   try {
@@ -25,7 +29,7 @@ async function initializeFaceDetector(): Promise<void> {
         delegate: 'GPU', // Or 'CPU'
       },
       runningMode: 'IMAGE',
-      minDetectionConfidence: 0.5,
+      minDetectionConfidence: 0.3,
     })
     log('FaceDetector initialized successfully.')
   } catch (error) {

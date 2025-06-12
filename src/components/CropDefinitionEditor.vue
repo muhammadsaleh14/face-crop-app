@@ -11,10 +11,11 @@ import { Label } from '@/components/ui/label';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Loader2, Info } from 'lucide-vue-next';
 
-// --- START DEBUG ---
-const DEBUG = true;
-const log = (...args: any[]) => DEBUG && console.log('[CropDefinitionEditor]', ...args);
-// --- END DEBUG ---
+const log = (...args: any[]) => {
+  if (import.meta.env.DEV) {
+    console.log('[CropDefinitionEditor]', ...args);
+  }
+};
 
 const store = useCropStore();
 const { templateImageUrl, templateFaceResult, definedCropParams } = storeToRefs(store);

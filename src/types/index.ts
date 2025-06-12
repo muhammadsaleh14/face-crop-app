@@ -5,6 +5,20 @@ export interface CropParams {
   topPaddingPercent: number // e.g., 25 means 25% of face height
   bottomPaddingPercent: number // e.g., 25 means 25% of face height
 }
+interface CropTask {
+  imageFile: File
+  sourceX: number
+  sourceY: number
+  sourceWidth: number
+  sourceHeight: number
+  outputWidth: number
+  outputHeight: number
+  outputFormat: string
+  quality: number
+  filename: string
+  originalFileId: string // To map the result back to the correct BatchImageFile
+  faceIndex: number // To create a unique filename for each face
+}
 export interface BoundingBox {
   // Renamed from PixelBoundingBox for clarity
   x: number

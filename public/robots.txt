@@ -1,0 +1,6 @@
+# Allow all crawlers full access
+User-agent: *
+Allow: /
+
+# Provide a link to the sitemap
+Sitemap: https://your-username.github.io/face-crop-app/sitemap.xml

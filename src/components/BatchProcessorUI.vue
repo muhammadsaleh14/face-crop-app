@@ -2,7 +2,7 @@
 import { ref, onMounted, onUnmounted, computed } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useCropStore } from '@/stores/cropStore'
-import { detectAllFaces } from '@/services/faceDetector'
+import { detectAllFaces, initializeFaceDetector } from '@/services/faceDetector'
 import { calculatePixelCropBox } from '@/utils/cropUtils'
 import { createZip, triggerZipDownload } from '@/services/zipService'
 import type { BatchImageFile, FaceDetectionResult } from '@/types'
@@ -12,10 +12,35 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/com
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Loader2 } from 'lucide-vue-next'
 
-// --- START DEBUG ---
-const DEBUG = true
-const log = (...args: any[]) => DEBUG && console.log('[BatchProcessorUI]', ...args)
-// --- END DEBUG ---
+// --- DEBUG LOGGING ---
+const log = (...args: any[]) => {
+  if (import.meta.env.DEV) {
+    console.log('[BatchProcessorUI]', ...args)
+  }
+}
+
+// --- NEW ARCHITECTURE: "Prepare-Then-Process" ---
+// This component now uses a two-stage approach to eliminate race conditions.
+// STAGE 1 (Preparation): All images are analyzed for faces on the main thread first.
+// A simple, flat "to-do list" (cropTaskQueue) of every single crop operation is created.
+// STAGE 2 (Processing): This flat queue is fed to the worker pool. The logic is now
+// trivial: if a worker is free and a task exists, dispatch it. This is much more
+// robust than the previous "resume" logic.
+
+interface CropTask {
+  imageFile: File
+  sourceX: number
+  sourceY: number
+  sourceWidth: number
+  sourceHeight: number
+  outputWidth: number
+  outputHeight: number
+  outputFormat: string
+  quality: number
+  filename: string
+  originalFileId: string // To map the result back to the correct BatchImageFile
+  faceIndex: number // To create a unique filename for each face
+}
 
 const store = useCropStore()
 const {
@@ -29,118 +54,69 @@ const {
 
 const MAX_WORKERS = navigator.hardwareConcurrency || 4
 const workers: Worker[] = []
-type QueueItem = BatchImageFile | { resumeImage: BatchImageFile; resumeFaceIndex: number }
-let imageQueue: QueueItem[] = []
-let activeWorkersCount = 0
-const imageProcessState = ref<
-  Record<
-    string,
-    {
-      totalOriginalFaces: number
-      facesDispatchedToWorker: number
-      facesReportedByWorker: number
-      facesSkippedLocally: number
-    }
-  >
->({})
-
 const workersInitialized = ref(false)
+
+// --- NEW STATE MANAGEMENT FOR PROCESSING ---
+const cropTaskQueue = ref<CropTask[]>([])
+const activeWorkersCount = ref(0)
+const totalTasksInBatch = ref(0)
 let initializeWorkersPromise: Promise<void> | null = null
 
+// Progress calculation is now simpler and more accurate
 const overallProgress = computed(() => {
-  if (batchImages.value.length === 0) return 0
-  const processedImagesCount = batchImages.value.filter(
-    (img) => img.status === 'cropped' || img.status === 'skipped' || img.status === 'error',
-  ).length
-  return (processedImagesCount / batchImages.value.length) * 100
+  if (totalTasksInBatch.value === 0) return 0
+  const tasksCompleted =
+    totalTasksInBatch.value - (cropTaskQueue.value.length + activeWorkersCount.value)
+  return (tasksCompleted / totalTasksInBatch.value) * 100
 })
 
+// --- WORKER INITIALIZATION ---
+// This remains largely the same, but the onmessage handler is simplified.
 async function initializeWorkersFn(): Promise<void> {
-  log('Attempting to initialize workers. Max:', MAX_WORKERS)
-  if (workersInitialized.value && workers.length === MAX_WORKERS) {
-    log('Workers already successfully initialized.')
-    return Promise.resolve()
-  }
-  if (initializeWorkersPromise) {
-    log('Worker initialization already in progress, returning existing promise.')
-    return initializeWorkersPromise
-  }
+  if (workersInitialized.value) return Promise.resolve()
+  if (initializeWorkersPromise) return initializeWorkersPromise
 
+  log(`Initializing ${MAX_WORKERS} workers...`)
   workers.forEach((w) => w.terminate())
   workers.length = 0
-  workersInitialized.value = false
 
   initializeWorkersPromise = (async () => {
     try {
       for (let i = 0; i < MAX_WORKERS; i++) {
         const worker = new Worker(new URL('/cropWorker.js', import.meta.url), { type: 'module' })
+
         worker.onmessage = (event) => {
           const {
             status,
             blob,
-            filename,
             error: workerError,
             originalFileId,
             faceIndex,
+            filename,
           } = event.data
-          log(
-            `Worker message for ${filename}, originalFileId: ${originalFileId}, faceIndex: ${faceIndex}, status: ${status}`,
-          )
+          log(`[Main] Worker message for ${filename}, face ${faceIndex + 1}: ${status}`)
 
-          if (activeWorkersCount > 0) activeWorkersCount--
-          log(`Active workers after message: ${activeWorkersCount}`)
+          activeWorkersCount.value-- // A worker is now free
 
-          if (originalFileId && imageProcessState.value[originalFileId]) {
-            imageProcessState.value[originalFileId].facesReportedByWorker++
-            const state = imageProcessState.value[originalFileId]
-            log(
-              `Image ${originalFileId} face reported. State: Dispatched=${state.facesDispatchedToWorker}, Reported=${state.facesReportedByWorker}, SkippedLocally=${state.facesSkippedLocally}, TotalOriginal=${state.totalOriginalFaces}`,
-            )
-
-            if (status === 'cropped' && blob) {
-              store.addCroppedBlobToImage(
-                originalFileId,
-                blob,
-                `_face${faceIndex !== undefined ? faceIndex + 1 : 'unknown'}`,
-              )
-            } else {
-              log(`Worker error for ${filename}, face ${faceIndex}: ${workerError || 'Unknown'}`)
-              store.updateBatchImageStatus(
-                originalFileId,
-                'error',
-                undefined,
-                `Face ${faceIndex !== undefined ? faceIndex + 1 : 'unknown'} crop failed: ${workerError || 'Error'}`,
-              )
-            }
-
-            const totalAccountedFor = state.facesReportedByWorker + state.facesSkippedLocally
-            if (totalAccountedFor >= state.totalOriginalFaces) {
-              log(`All ${state.totalOriginalFaces} faces accounted for image ${originalFileId}.`)
-              const img = batchImages.value.find((i) => i.id === originalFileId)
-              if (img && img.status !== 'error' && img.status !== 'skipped') {
-                if (img.croppedBlobs && img.croppedBlobs.length > 0) {
-                  store.updateBatchImageStatus(originalFileId, 'cropped')
-                } else {
-                  store.updateBatchImageStatus(
-                    originalFileId,
-                    'skipped',
-                    'No faces were successfully cropped (all failed or were invalid).',
-                  )
-                }
-              }
-            }
+          if (status === 'cropped' && blob) {
+            store.addCroppedBlobToImage(originalFileId, blob, `_face${faceIndex + 1}`)
           } else {
-            log(
-              `Error: No process state for originalFileId: ${originalFileId} from worker message. File: ${filename}`,
+            log(`Worker error for ${filename}, face ${faceIndex + 1}: ${workerError}`)
+            store.updateBatchImageStatus(
+              originalFileId,
+              'error',
+              undefined,
+              `Face ${faceIndex + 1} crop failed: ${workerError || 'Unknown Error'}`,
             )
           }
-
-          processNextImageFromQueue()
+          // The key to the new architecture: simply try to process the next task.
+          processNextTaskFromQueue()
         }
+
         worker.onerror = (error) => {
-          log('Critical worker error:', error)
-          if (activeWorkersCount > 0) activeWorkersCount--
-          processNextImageFromQueue()
+          console.error('Critical worker error:', error)
+          activeWorkersCount.value--
+          processNextTaskFromQueue()
         }
         workers.push(worker)
       }
@@ -156,302 +132,174 @@ async function initializeWorkersFn(): Promise<void> {
   return initializeWorkersPromise
 }
 
-async function processImageFaces(imageFile: BatchImageFile, startingFaceIndex: number = 0) {
-  log(
-    `processImageFaces START for ${imageFile.file.name} (ID: ${imageFile.id}), starting face index ${startingFaceIndex}`,
-  )
+// --- STAGE 1: PREPARATION ---
+async function createCropTaskQueue() {
+  log('--- Starting Stage 1: Creating Crop Task Queue ---')
+  const tasks: CropTask[] = []
 
-  if (!workersInitialized.value || workers.length === 0) {
-    log(
-      `processImageFaces for ${imageFile.file.name}: Workers not ready. Updating status to error.`,
-    )
-    store.updateBatchImageStatus(
-      imageFile.id,
-      'error',
-      undefined,
-      'Internal error: Workers not ready.',
-    )
-    return
-  }
+  for (const image of store.batchImages) {
+    try {
+      store.updateBatchImageStatus(image.id, 'processing')
+      const imageElement = await loadImageToElement(image.file)
+      const faceResult = await detectAllFaces(imageElement)
 
-  let imageElement: HTMLImageElement | null = null
-  let faceDetectionResult: FaceDetectionResult | null = null
-  let localErrorOccurred = false
+      console.log(`[DIAGNOSTIC] For ${image.file.name}, face detection result:`, faceResult)
 
-  try {
-    log(`processImageFaces: Loading image "${imageFile.file.name}" into element.`)
-    imageElement = await loadImageToElement(imageFile.file)
-    log(
-      `processImageFaces: loadImageToElement completed for "${imageFile.file.name}". imageElement defined: ${!!imageElement}, naturalWidth: ${imageElement?.naturalWidth}`,
-    )
+      if (faceResult && faceResult.allDetectedBoundingBoxes.length > 0 && definedCropParams.value) {
+        log(`Found ${faceResult.detectionCount} faces in ${image.file.name}.`)
 
-    if (!imageElement || imageElement.naturalWidth === 0) {
-      log(`processImageFaces: CRITICAL - loadImageToElement invalid for "${imageFile.file.name}".`)
-      throw new Error(`Failed to load image data for ${imageFile.file.name}`)
-    }
-
-    log(`processImageFaces: Calling detectAllFaces for "${imageFile.file.name}".`)
-    faceDetectionResult = await detectAllFaces(imageElement)
-    log(
-      `processImageFaces: detectAllFaces completed for "${imageFile.file.name}". Result:`,
-      faceDetectionResult ? `${faceDetectionResult.detectionCount} faces` : 'null',
-    )
-
-    if (
-      faceDetectionResult &&
-      faceDetectionResult.allDetectedBoundingBoxes.length > 0 &&
-      definedCropParams.value
-    ) {
-      const allFaces = faceDetectionResult.allDetectedBoundingBoxes
-      log(
-        `${imageFile.file.name}: Found ${allFaces.length} total faces. Processing from index ${startingFaceIndex}.`,
-      )
-
-      if (!imageProcessState.value[imageFile.id] || startingFaceIndex === 0) {
-        imageProcessState.value[imageFile.id] = {
-          totalOriginalFaces: allFaces.length,
-          facesDispatchedToWorker: 0,
-          facesReportedByWorker: 0,
-          facesSkippedLocally: 0,
-        }
-      }
-      const currentState = imageProcessState.value[imageFile.id]
-      currentState.totalOriginalFaces = allFaces.length
-
-      for (let i = startingFaceIndex; i < allFaces.length; i++) {
-        if (activeWorkersCount >= MAX_WORKERS) {
-          log(`Workers full. Re-queuing ${imageFile.file.name} to resume from face index ${i}.`)
-          imageQueue.unshift({ resumeImage: imageFile, resumeFaceIndex: i })
-          return
-        }
-
-        const faceBox = allFaces[i]
-        const pixelCropSourceBox = calculatePixelCropBox(
-          faceBox,
-          definedCropParams.value,
-          imageElement.naturalWidth,
-          imageElement.naturalHeight,
-        )
-
-        if (pixelCropSourceBox) {
-          activeWorkersCount++
-          currentState.facesDispatchedToWorker++
-          const workerIndex = (currentState.facesDispatchedToWorker - 1) % workers.length
-          const workerToUse = workers[workerIndex]
-
-          log(
-            `Dispatching ${imageFile.file.name} - Face ${i + 1} (index ${i}). Active: ${activeWorkersCount}`,
+        for (let i = 0; i < faceResult.allDetectedBoundingBoxes.length; i++) {
+          const faceBox = faceResult.allDetectedBoundingBoxes[i]
+          const pixelCropBox = calculatePixelCropBox(
+            faceBox,
+            definedCropParams.value,
+            imageElement.naturalWidth,
+            imageElement.naturalHeight,
           )
-          workerToUse.postMessage({
-            imageFile: imageFile.file,
-            sourceX: pixelCropSourceBox.x,
-            sourceY: pixelCropSourceBox.y,
-            sourceWidth: pixelCropSourceBox.width,
-            sourceHeight: pixelCropSourceBox.height,
-            outputWidth: pixelCropSourceBox.width,
-            outputHeight: pixelCropSourceBox.height,
-            outputFormat: 'image/png',
-            quality: 0.9,
-            filename: imageFile.file.name,
-            originalFileId: imageFile.id,
-            faceIndex: i,
-          })
-        } else {
-          log(`Skipping face ${i + 1} in ${imageFile.file.name} (invalid local crop box).`)
-          currentState.facesSkippedLocally++
+
+          if (pixelCropBox) {
+            tasks.push({
+              imageFile: image.file, // Pass the actual File object
+              sourceX: pixelCropBox.x,
+              sourceY: pixelCropBox.y,
+              sourceWidth: pixelCropBox.width,
+              sourceHeight: pixelCropBox.height,
+              outputWidth: pixelCropBox.width,
+              outputHeight: pixelCropBox.height,
+              outputFormat: 'image/png',
+              quality: 0.9,
+              filename: image.file.name,
+              originalFileId: image.id,
+              faceIndex: i,
+            })
+          }
         }
-      }
-
-      const dispatchInfo = imageProcessState.value[imageFile.id]
-      if (
-        dispatchInfo.facesDispatchedToWorker === 0 &&
-        allFaces.length > 0 &&
-        startingFaceIndex === 0
-      ) {
-        log(`${imageFile.file.name}: No faces were dispatched (all invalid).`)
-        store.updateBatchImageStatus(
-          imageFile.id,
-          'skipped',
-          `All ${allFaces.length} detected faces resulted in invalid crop dimensions.`,
-        )
-      }
-    } else {
-      let reason = 'No faces detected in image (or no valid bounding boxes returned).'
-      if (!definedCropParams.value) reason = 'Crop parameters not defined.'
-      log(`Skipping ${imageFile.file.name}: ${reason}`)
-      store.updateBatchImageStatus(imageFile.id, 'skipped', reason)
-      if (!imageProcessState.value[imageFile.id]) {
-        imageProcessState.value[imageFile.id] = {
-          totalOriginalFaces: 0,
-          facesDispatchedToWorker: 0,
-          facesReportedByWorker: 0,
-          facesSkippedLocally: 0,
-        }
-      }
-    }
-  } catch (error: any) {
-    localErrorOccurred = true
-    log(
-      `CRITICAL Error during main thread processing for ${imageFile.file.name}:`,
-      error.message,
-      error.stack,
-    )
-    store.updateBatchImageStatus(
-      imageFile.id,
-      'error',
-      undefined,
-      `Main thread error processing ${imageFile.file.name}: ${error.message}`,
-    )
-  } finally {
-    log(`processImageFaces FINALLY for ${imageFile.file.name}.`)
-    const currentState = imageProcessState.value[imageFile.id]
-    const wasReQueued = imageQueue.some((item) =>
-      typeof item === 'string'
-        ? false
-        : 'resumeImage' in item && item.resumeImage.id === imageFile.id,
-    )
-
-    if (!wasReQueued) {
-      let shouldTriggerPNIQ = false
-      if (localErrorOccurred) {
-        log(`processImageFaces for ${imageFile.file.name} had local error. Triggering PNIQ.`)
-        shouldTriggerPNIQ = true
-      } else if (currentState && currentState.facesDispatchedToWorker === 0) {
-        log(`processImageFaces for ${imageFile.file.name}: No tasks dispatched. Triggering PNIQ.`)
-        shouldTriggerPNIQ = true
-      } else if (!currentState && !faceDetectionResult) {
-        log(
-          `processImageFaces for ${imageFile.file.name}: No face detection result and no state. Triggering PNIQ.`,
-        )
-        shouldTriggerPNIQ = true
-      }
-
-      if (shouldTriggerPNIQ) {
-        processNextImageFromQueue()
       } else {
-        log(
-          `processImageFaces for ${imageFile.file.name}: Tasks were dispatched or re-queued. PNIQ will be called by workers.`,
+        log(`Skipping ${image.file.name}: No faces detected.`)
+        store.updateBatchImageStatus(image.id, 'skipped', 'No faces detected in image.')
+      }
+    } catch (error: any) {
+      log(`Error preparing ${image.file.name}: ${error.message}`)
+      store.updateBatchImageStatus(
+        image.id,
+        'error',
+        undefined,
+        `Failed to analyze image: ${error.message}`,
+      )
+    }
+  }
+
+  log(`--- Stage 1 Complete. Created ${tasks.length} total crop tasks. ---`)
+  cropTaskQueue.value = tasks
+  totalTasksInBatch.value = tasks.length
+}
+
+// --- STAGE 2: PROCESSING ---
+// --- STAGE 2: PROCESSING ---
+function processNextTaskFromQueue() {
+  // Check for completion: Is the queue empty and are no workers busy?
+  if (cropTaskQueue.value.length === 0 && activeWorkersCount.value === 0) {
+    log('Queue empty & all workers idle. Finalizing batch.')
+
+    // Final check to update status for all processed images.
+    // This ensures images with partial errors but some successes are marked 'cropped'.
+    store.batchImages.forEach((img) => {
+      // If the image has cropped blobs and wasn't already marked as a total error...
+      if (img.croppedBlobs && img.croppedBlobs.length > 0) {
+        if (img.status !== 'error') {
+          store.updateBatchImageStatus(img.id, 'cropped')
+        }
+      } else if (img.status === 'processing') {
+        // If an image was being processed but yielded no blobs (e.g., all faces were invalid or failed)
+        // mark it as 'skipped' so it doesn't stay in the 'processing' state forever.
+        store.updateBatchImageStatus(
+          img.id,
+          'skipped',
+          'All detected faces resulted in invalid or failed crops.',
         )
       }
-    } else {
-      log(
-        `processImageFaces for ${imageFile.file.name} was re-queued. PNIQ will be triggered by other events.`,
-      )
-    }
-  }
-}
+    })
 
-async function processNextImageFromQueue() {
-  log(`PNIQ Start. Queue: ${imageQueue.length}, Active Workers: ${activeWorkersCount}`)
-  if (imageQueue.length === 0 && activeWorkersCount === 0) {
-    log('PNIQ: Queue empty & workers idle. Finishing batch.')
     store.finishBatchProcessing()
-    return
-  }
-  if (activeWorkersCount >= MAX_WORKERS && imageQueue.length > 0) {
-    log('PNIQ: Workers full. Waiting for a worker to free up.')
-    return
-  }
-  if (imageQueue.length === 0) {
-    log(`PNIQ: Queue empty, but ${activeWorkersCount} workers still active. Waiting.`)
-    return
+    return // Stop the process
   }
 
-  const nextItem = imageQueue[0] // Peek
-  if (!nextItem) {
-    log('PNIQ: Queue had an item, but it was null/undefined. This should not happen. Trying again.')
-    imageQueue.shift() // Remove the bad item
-    processNextImageFromQueue()
-    return
-  }
+  // Check if we can dispatch more tasks: Is there work to do and is a worker free?
+  if (cropTaskQueue.value.length > 0 && activeWorkersCount.value < MAX_WORKERS) {
+    activeWorkersCount.value++
 
-  imageQueue.shift() // Now take it for real
+    // Take the next task from the queue. This is a Vue reactivity proxy.
+    const taskProxy = cropTaskQueue.value.shift()!
 
-  if (typeof nextItem === 'object' && 'resumeImage' in nextItem) {
+    // Find an available worker
+    const workerIndex = (totalTasksInBatch.value - cropTaskQueue.value.length - 1) % workers.length
+    const workerToUse = workers[workerIndex]
+
     log(
-      `PNIQ: Resuming image ${nextItem.resumeImage.file.name} from face index ${nextItem.resumeFaceIndex}`,
+      `Dispatching task for ${taskProxy.filename} (Face ${taskProxy.faceIndex + 1}). Tasks in queue: ${cropTaskQueue.value.length}. Active workers: ${activeWorkersCount.value}`,
     )
-    await processImageFaces(nextItem.resumeImage, nextItem.resumeFaceIndex)
-  } else {
-    const imageFile = nextItem as BatchImageFile
-    if (imageFile.status === 'pending') {
-      store.updateBatchImageStatus(imageFile.id, 'processing')
-      log(`PNIQ: Processing new image ${imageFile.file.name}`)
-      await processImageFaces(imageFile)
-    } else {
-      log(
-        `PNIQ: Image ${imageFile.file.name} status is ${imageFile.status}, not 'pending'. Trying next.`,
-      )
-      processNextImageFromQueue()
+
+    // FIX: Create a new, plain JavaScript object from the proxy to make it cloneable.
+    // This strips the non-cloneable Vue reactivity wrapper before sending it to the worker.
+    const plainTask = {
+      imageFile: taskProxy.imageFile,
+      sourceX: taskProxy.sourceX,
+      sourceY: taskProxy.sourceY,
+      sourceWidth: taskProxy.sourceWidth,
+      sourceHeight: taskProxy.sourceHeight,
+      outputWidth: taskProxy.outputWidth,
+      outputHeight: taskProxy.outputHeight,
+      outputFormat: taskProxy.outputFormat,
+      quality: taskProxy.quality,
+      filename: taskProxy.filename,
+      originalFileId: taskProxy.originalFileId,
+      faceIndex: taskProxy.faceIndex,
     }
+
+    // Send the plain, cloneable object to the worker.
+    workerToUse.postMessage(plainTask)
   }
 }
 
+// --- MAIN ORCHESTRATOR ---
 async function processBatch() {
-  log('Process Batch button clicked.')
+  log('Process Batch triggered.')
   if (!definedCropParams.value || batchImages.value.length === 0 || isProcessingBatch.value) {
-    log('Process Batch: Conditions not met or already processing.')
     return
   }
 
   await initializeWorkersFn()
   if (!workersInitialized.value || workers.length === 0) {
-    log('Process Batch: Worker initialization failed. Cannot start batch.')
-    alert('Error: Could not initialize processing workers. Please try refreshing the page.')
+    alert('Error: Could not initialize processing workers. Please refresh the page.')
     return
   }
 
-  imageProcessState.value = {}
   store.startBatchProcessing()
-  imageQueue = batchImages.value
-    .filter((img) => img.status === 'pending')
-    .map((img) => ({ ...img }))
-  log('Process Batch: Initializing queue with pending items:', imageQueue.length)
 
+  // Run Stage 1 and wait for it to complete
+  await createCropTaskQueue()
+
+  // Kick off Stage 2 by populating the worker pool
+  log('--- Starting Stage 2: Processing Task Queue ---')
   for (let i = 0; i < MAX_WORKERS; i++) {
-    if (imageQueue.length > 0 && activeWorkersCount < MAX_WORKERS) {
-      processNextImageFromQueue()
-    } else {
-      break
-    }
+    processNextTaskFromQueue()
   }
 }
 
+// --- UTILITY FUNCTIONS (Unchanged) ---
+
 function loadImageToElement(file: File): Promise<HTMLImageElement> {
-  log(`loadImageToElement: Starting for file "${file.name}"`)
   return new Promise((resolve, reject) => {
-    if (!(file instanceof File)) {
-      log(
-        `loadImageToElement: CRITICAL - input is not a File object for "${file?.name || 'unknown file'}"`,
-      )
-      reject(new Error(`Invalid input: not a File object for "${file?.name || 'unknown file'}"`))
-      return
-    }
     const reader = new FileReader()
     reader.onload = (e) => {
-      log(`loadImageToElement: FileReader onload for "${file.name}"`)
       const img = new Image()
-      img.onload = () => {
-        log(
-          `loadImageToElement: HTMLImageElement onload for "${file.name}". Dimensions: ${img.naturalWidth}x${img.naturalHeight}. Resolving.`,
-        )
-        resolve(img)
-      }
-      img.onerror = (errEvent) => {
-        log(`loadImageToElement: HTMLImageElement onerror for "${file.name}".`, errEvent)
-        reject(new Error(`Failed to load image file "${file.name}" into HTMLImageElement.`))
-      }
-      if (e.target?.result) {
-        img.src = e.target.result as string
-      } else {
-        log(`loadImageToElement: FileReader result was null for "${file.name}". Rejecting.`)
-        reject(new Error(`FileReader result was null for file "${file.name}".`))
-      }
+      img.onload = () => resolve(img)
+      img.onerror = (err) =>
+        reject(new Error(`Failed to load image file into element: ${file.name}`))
+      if (e.target?.result) img.src = e.target.result as string
+      else reject(new Error(`FileReader result was null for file: ${file.name}`))
     }
-    reader.onerror = (errEvent) => {
-      log(`loadImageToElement: FileReader onerror for "${file.name}".`, errEvent)
-      reject(new Error(`FileReader failed to read file "${file.name}".`))
-    }
+    reader.onerror = () => reject(new Error(`FileReader failed to read file: ${file.name}`))
     reader.readAsDataURL(file)
   })
 }
@@ -459,15 +307,10 @@ function loadImageToElement(file: File): Promise<HTMLImageElement> {
 async function handleDownloadZip() {
   const filesToZip: { filename: string; blob: Blob }[] = []
   batchImages.value.forEach((img) => {
-    if (
-      (img.status === 'cropped' ||
-        (img.status === 'error' && img.croppedBlobs && img.croppedBlobs.length > 0)) &&
-      img.croppedBlobs &&
-      img.croppedBlobs.length > 0
-    ) {
+    if (img.croppedBlobs && img.croppedBlobs.length > 0) {
       const filenameParts = img.file.name.split('.')
       const extension = filenameParts.length > 1 ? filenameParts.pop() || 'png' : 'png'
-      const baseFilename = filenameParts.join('.') || img.file.name
+      const baseFilename = filenameParts.join('.')
 
       img.croppedBlobs.forEach((cb) => {
         filesToZip.push({
@@ -492,9 +335,17 @@ async function handleDownloadZip() {
   }
 }
 
+// --- LIFECYCLE HOOKS ---
 onMounted(async () => {
   initializeWorkersFn().catch((err) => {
     console.error('Failed to initialize workers on mount:', err)
+  })
+  initializeFaceDetector().catch((err) => {
+    console.error('Failed to initialize face detector on mount:', err)
+    // You could show an error to the user here if you wanted.
+    alert(
+      'Could not initialize the face detection model. The app may not work correctly. Please check your internet connection and refresh the page.',
+    )
   })
 })
 
@@ -502,12 +353,13 @@ onUnmounted(() => {
   log('BatchProcessorUI unmounted. Terminating workers.')
   workers.forEach((worker) => worker.terminate())
   workers.length = 0
-  imageQueue = []
-  activeWorkersCount = 0
+  cropTaskQueue.value = []
+  activeWorkersCount.value = 0
   workersInitialized.value = false
   initializeWorkersPromise = null
 })
 
+// Expose the main method to be called by the parent component (App.vue)
 defineExpose({
   processBatch,
 })
@@ -515,17 +367,15 @@ defineExpose({
 
 <template>
   <div class="space-y-6">
-    <Button :disabled="true" class="w-full" aria-live="polite">
-      <Loader2 v-if="isProcessingBatch" class="mr-2 h-4 w-4 animate-spin" />
+    <Button v-if="isProcessingBatch" :disabled="true" class="w-full" aria-live="polite">
+      <Loader2 class="mr-2 h-4 w-4 animate-spin" />
       {{
-        isProcessingBatch
-          ? `Processing ${activeWorkersCount} active tasks... (${imageQueue.length} items pending in queue)`
-          : 'Starting...'
+        `Processing... (${totalTasksInBatch - (cropTaskQueue.length + activeWorkersCount)} / ${totalTasksInBatch} faces)`
       }}
     </Button>
 
-    <div v-if="batchImages.length > 0 || isProcessingBatch">
-      <h3 class="text-lg font-medium mb-2">Overall Progress (Images)</h3>
+    <div v-if="batchImages.length > 0">
+      <h3 class="text-lg font-medium mb-2">Overall Progress (Faces)</h3>
       <Progress :model-value="overallProgress" class="w-full" />
       <p class="text-sm text-slate-600 dark:text-slate-400 mt-1 text-center">
         {{ successfullyCroppedImageCount }} images with crops / {{ totalIndividualCropsMade }} total

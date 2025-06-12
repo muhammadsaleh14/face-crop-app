@@ -1,10 +1,11 @@
 import { defineStore } from 'pinia'
 import type { CropParams, FaceDetectionResult, BatchImageFile } from '@/types'
 
-// --- START DEBUG ---
-const DEBUG = true
-const log = (...args: any[]) => DEBUG && console.log('[CropStore]', ...args)
-// --- END DEBUG ---
+const log = (...args: any[]) => {
+  if (import.meta.env.DEV) {
+    console.log('[CropDefinitionEditor]', ...args)
+  }
+}
 
 interface CropState {
   templateImage: File | null
