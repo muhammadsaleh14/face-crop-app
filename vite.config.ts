@@ -21,7 +21,7 @@ export default {
     // This will generate a sitemap.xml for you, which is great for SEO.
     sitemap: {
       // IMPORTANT: Replace this with your actual production domain!
-      hostname: 'https://your-domain.com',
+      hostname: 'https://freebulkfacecropapp.netlify.app',
     },
   },
 
