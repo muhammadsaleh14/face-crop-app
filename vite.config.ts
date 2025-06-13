@@ -25,5 +25,5 @@ export default {
     },
   },
 
-  base: process.env.NODE_ENV === 'production' ? '/face-crop-app/' : '/',
+  base: process.env.NODE_ENV === 'production' ? '/' : '/',
 }
